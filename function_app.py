@@ -10,8 +10,9 @@ from azure.storage.blob import BlobServiceClient
 import psycopg2
 from psycopg2.extras import execute_batch
 from typing import List, Dict, Any
+from dbschema import ensure_database_schema
 
-app = func.FunctionApp()
+app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 # Blob trigger function - automatically processes new files
 @app.blob_trigger(arg_name="myblob", 
