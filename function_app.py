@@ -27,68 +27,6 @@ try:
 except Exception as e:
     logging.error(f"Error validating database schema on startup: {str(e)}")
 
-# Add a health check endpoint
-@app.route(route="health")
-def health_check(req: func.HttpRequest) -> func.HttpResponse:
-    """Health check endpoint for the function app."""
-    try:
-        # Check storage connectivity
-        connection_string = os.environ["AzureWebJobsStorage"]
-        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-        
-        # Check if source container exists
-        source_container_client = blob_service_client.get_container_client(SOURCE_CONTAINER)
-        source_exists = source_container_client.exists()
-        
-        # Check if processed container exists
-        processed_container_client = blob_service_client.get_container_client(PROCESSED_CONTAINER)
-        processed_exists = processed_container_client.exists()
-        
-        # Check database connectivity
-        db_host = os.environ["POSTGRES_HOST"]
-        db_name = os.environ["POSTGRES_DB"]
-        db_user = os.environ["POSTGRES_USER"]
-        db_password = os.environ["POSTGRES_PASSWORD"]
-        ssl_mode = os.environ.get("POSTGRES_SSL_MODE", "require")
-        
-        # Test database connection
-        conn = psycopg2.connect(
-            host=db_host,
-            database=db_name,
-            user=db_user,
-            password=db_password,
-            sslmode=ssl_mode
-        )
-        conn.close()
-        
-        return func.HttpResponse(
-            json.dumps({
-                "status": "healthy",
-                "timestamp": datetime.now().isoformat(),
-                "storage": {
-                    "source_container": {
-                        "name": SOURCE_CONTAINER,
-                        "exists": source_exists
-                    },
-                    "processed_container": {
-                        "name": PROCESSED_CONTAINER,
-                        "exists": processed_exists
-                    }
-                },
-                "database": "connected"
-            }),
-            mimetype="application/json"
-        )
-    except Exception as e:
-        return func.HttpResponse(
-            json.dumps({
-                "status": "unhealthy",
-                "timestamp": datetime.now().isoformat(),
-                "error": str(e)
-            }),
-            status_code=500,
-            mimetype="application/json"
-        )
 
 @app.blob_trigger(arg_name="myblob", 
                  path="csv-purchases/{name}",
