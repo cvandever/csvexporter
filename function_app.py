@@ -6,38 +6,19 @@ import json
 import pandas as pd
 from datetime import datetime
 import os
-import ssl
-import certifi
 from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 import psycopg2
 from psycopg2.extras import execute_batch
 from typing import List, Dict, Any
 from retrying import retry
-from dbschema import ensure_database_schema, check_table_constraints
+from dbschema import ensure_database_schema
 import hashlib
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 SOURCE_CONTAINER = os.environ.get("BLOB_CONTAINER", "csv-purchases")
 PROCESSED_CONTAINER = os.environ.get("BLOB_PROCESSED", "processed-csv")
-
-# Configure SSL context for Azure connections
-def create_ssl_context():
-    """Create SSL context with proper certificate verification."""
-    try:
-        # Use certifi for certificate verification
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = True
-        ssl_context.verify_mode = ssl.CERT_REQUIRED
-        
-        # Use certifi's certificate bundle
-        ssl_context.load_verify_locations(certifi.where())
-        
-        return ssl_context
-    except Exception as e:
-        logging.warning(f"Could not create SSL context: {e}. Using default SSL settings.")
-        return None
 
 # Initialize schema on startup
 try:
@@ -80,10 +61,6 @@ def health_check(req: func.HttpRequest) -> func.HttpResponse:
         )
         conn.close()
         
-        # Check table constraints for debugging
-        purchases_constraints = check_table_constraints("purchases")
-        users_constraints = check_table_constraints("users")
-        
         return func.HttpResponse(
             json.dumps({
                 "status": "healthy",
@@ -98,11 +75,7 @@ def health_check(req: func.HttpRequest) -> func.HttpResponse:
                         "exists": processed_exists
                     }
                 },
-                "database": "connected",
-                "constraints": {
-                    "purchases": purchases_constraints,
-                    "users": users_constraints
-                }
+                "database": "connected"
             }),
             mimetype="application/json"
         )
@@ -204,19 +177,10 @@ def determine_file_type(blob_name: str) -> str:
         return "unknown"
 
 def check_blob_exists_in_source(blob_name: str) -> bool:
-    """Check if blob still exists in the source container with SSL handling."""
+    """Check if blob still exists in the source container."""
     try:
         connection_string = os.environ["AzureWebJobsStorage"]
-        
-        # Create blob service client with SSL context
-        ssl_context = create_ssl_context()
-        if ssl_context:
-            blob_service_client = BlobServiceClient.from_connection_string(
-                connection_string,
-                ssl_context=ssl_context
-            )
-        else:
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         
         blob_client = blob_service_client.get_blob_client(
             container=SOURCE_CONTAINER,
@@ -228,19 +192,6 @@ def check_blob_exists_in_source(blob_name: str) -> bool:
         return True
     except ResourceNotFoundError:
         return False
-    except ssl.SSLError as e:
-        logging.warning(f"SSL error checking blob existence for {blob_name}: {str(e)}")
-        # Try without SSL verification as fallback
-        try:
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-            blob_client = blob_service_client.get_blob_client(
-                container=SOURCE_CONTAINER,
-                blob=blob_name
-            )
-            blob_client.get_blob_properties()
-            return True
-        except Exception:
-            return True  # Assume it exists to avoid skipping processing
     except Exception as e:
         logging.warning(f"Error checking blob existence for {blob_name}: {str(e)}")
         return True  # Assume it exists to avoid skipping processing
@@ -249,16 +200,7 @@ def check_already_processed(blob_name: str) -> bool:
     """Check if blob was already processed by looking in processed container."""
     try:
         connection_string = os.environ["AzureWebJobsStorage"]
-        
-        # Create blob service client with SSL handling
-        ssl_context = create_ssl_context()
-        if ssl_context:
-            blob_service_client = BlobServiceClient.from_connection_string(
-                connection_string,
-                ssl_context=ssl_context
-            )
-        else:
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         
         processed_blob_client = blob_service_client.get_blob_client(
             container=PROCESSED_CONTAINER,
@@ -270,21 +212,6 @@ def check_already_processed(blob_name: str) -> bool:
         return True
     except ResourceNotFoundError:
         return False
-    except ssl.SSLError as e:
-        logging.warning(f"SSL error checking processed status for {blob_name}: {str(e)}")
-        # Try without SSL verification as fallback
-        try:
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-            processed_blob_client = blob_service_client.get_blob_client(
-                container=PROCESSED_CONTAINER,
-                blob=blob_name
-            )
-            processed_blob_client.get_blob_properties()
-            return True
-        except ResourceNotFoundError:
-            return False
-        except Exception:
-            return False
     except Exception as e:
         logging.warning(f"Error checking processed status for {blob_name}: {str(e)}")
         return False
@@ -310,10 +237,13 @@ def mark_as_processed(blob_name: str, processing_id: str, record_count: int) -> 
         
         cursor = conn.cursor()
         
-        # Insert processing record with safer approach
+        # Insert processing record
         processing_query = """
         INSERT INTO file_analytics (file_id, file_name, file_type, analytics, processed_at) 
         VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (file_id) DO UPDATE SET
+            processed_at = EXCLUDED.processed_at,
+            analytics = EXCLUDED.analytics
         """
         
         analytics_data = {
@@ -323,30 +253,13 @@ def mark_as_processed(blob_name: str, processing_id: str, record_count: int) -> 
             "processed_at": datetime.now().isoformat()
         }
         
-        try:
-            cursor.execute(processing_query, (
-                processing_id,
-                blob_name,
-                "processing_log",
-                json.dumps(analytics_data),
-                datetime.now()
-            ))
-        except psycopg2.Error as e:
-            if "duplicate key" in str(e).lower():
-                # Update existing record
-                update_query = """
-                UPDATE file_analytics 
-                SET processed_at = %s, analytics = %s 
-                WHERE file_id = %s
-                """
-                cursor.execute(update_query, (
-                    datetime.now(),
-                    json.dumps(analytics_data),
-                    processing_id
-                ))
-                logging.info(f"Updated existing processing record for {blob_name}")
-            else:
-                raise
+        cursor.execute(processing_query, (
+            processing_id,
+            blob_name,
+            "processing_log",
+            json.dumps(analytics_data),
+            datetime.now()
+        ))
         
         conn.commit()
         cursor.close()
@@ -355,7 +268,6 @@ def mark_as_processed(blob_name: str, processing_id: str, record_count: int) -> 
     except Exception as e:
         logging.warning(f"Could not mark {blob_name} as processed: {str(e)}")
 
-# ... (keeping other functions as they are)
 @retry(stop_max_attempt_number=3, wait_fixed=1000)
 def process_csv_data(csv_data: str, file_type: str = "users") -> List[Dict[str, Any]]:
     """Process CSV data into structured records with enhanced error handling."""
@@ -537,16 +449,7 @@ def move_blob_to_processed(blob_name: str):
     try:
         # Get connection string from app settings - use AzureWebJobsStorage for consistency
         connection_string = os.environ["AzureWebJobsStorage"]
-        
-        # Create blob service client with SSL handling
-        ssl_context = create_ssl_context()
-        if ssl_context:
-            blob_service_client = BlobServiceClient.from_connection_string(
-                connection_string,
-                ssl_context=ssl_context
-            )
-        else:
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         
         # Get source blob client
         source_blob_client = blob_service_client.get_blob_client(
@@ -600,16 +503,6 @@ def move_blob_to_processed(blob_name: str):
         source_blob_client.delete_blob()
         logging.info(f"Deleted {blob_name} from {SOURCE_CONTAINER}")
         
-    except ssl.SSLError as e:
-        logging.warning(f"SSL error during blob move for {blob_name}: {str(e)}")
-        # Try without SSL verification as fallback
-        try:
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-            # Repeat the move operation without SSL context
-            # ... (same logic as above but without SSL context)
-        except Exception as fallback_e:
-            logging.error(f"Fallback blob move also failed for {blob_name}: {str(fallback_e)}")
-            raise
     except ResourceNotFoundError as e:
         logging.info(f"Blob {blob_name} not found during move operation - likely already processed")
     except Exception as e:
@@ -692,99 +585,48 @@ def save_to_database(data: List[Dict[str, Any]], analytics: Dict[str, Any], file
                 row_values.append(csv_value)
             batch_data.append(tuple(row_values))
         
-        # Check if unique constraints exist for conflict resolution
-        constraint_check_query = """
-        SELECT constraint_name, column_name 
-        FROM information_schema.key_column_usage kcu
-        JOIN information_schema.table_constraints tc 
-            ON kcu.constraint_name = tc.constraint_name
-        WHERE tc.table_name = %s 
-            AND tc.constraint_type = 'UNIQUE'
-        """
-        cursor.execute(constraint_check_query, (table_name,))
-        unique_constraints = cursor.fetchall()
-        
-        # Build insert query based on available constraints
-        has_user_id_constraint = any("user_id" in constraint[1].lower() for constraint in unique_constraints)
-        has_transaction_id_constraint = any("transaction_id" in constraint[1].lower() for constraint in unique_constraints)
-        
-        if file_type == "users" and has_user_id_constraint and "user_id" in [col.lower() for col in valid_columns]:
+        # Prepare insert query with conflict handling
+        if file_type == "users" and "user_id" in [col.lower() for col in valid_columns]:
             # For users, handle duplicates by user_id
-            non_id_columns = [col for col in valid_columns if col.lower() not in ['id']]
             insert_query = f'''
                 INSERT INTO {table_name} ({column_str}) VALUES ({placeholders})
                 ON CONFLICT (user_id) DO UPDATE SET
-                    {", ".join([f'"{col}" = EXCLUDED."{col}"' for col in non_id_columns])}
+                    {", ".join([f'"{col}" = EXCLUDED."{col}"' for col in valid_columns if col.lower() != 'id'])}
             '''
-        elif file_type == "purchases" and has_transaction_id_constraint and "transaction_id" in [col.lower() for col in valid_columns]:
+        elif file_type == "purchases" and "transaction_id" in [col.lower() for col in valid_columns]:
             # For purchases, handle duplicates by transaction_id
-            non_id_columns = [col for col in valid_columns if col.lower() not in ['id']]
             insert_query = f'''
                 INSERT INTO {table_name} ({column_str}) VALUES ({placeholders})
                 ON CONFLICT (transaction_id) DO UPDATE SET
-                    {", ".join([f'"{col}" = EXCLUDED."{col}"' for col in non_id_columns])}
+                    {", ".join([f'"{col}" = EXCLUDED."{col}"' for col in valid_columns if col.lower() != 'id'])}
             '''
         else:
-            # Simple insert without conflict resolution (will fail on duplicates)
+            # Simple insert without conflict resolution
             insert_query = f'INSERT INTO {table_name} ({column_str}) VALUES ({placeholders})'
-            logging.warning(f"[{processing_id}] No unique constraints found for {table_name}, using simple INSERT")
         
         # Execute batch insert
-        try:
-            execute_batch(cursor, insert_query, batch_data, page_size=100)
-        except psycopg2.Error as e:
-            if "duplicate key" in str(e).lower():
-                logging.warning(f"[{processing_id}] Duplicate key error, trying individual inserts for {file_type}")
-                # Try inserting rows individually to handle duplicates
-                simple_insert = f'INSERT INTO {table_name} ({column_str}) VALUES ({placeholders})'
-                successful_inserts = 0
-                for row_data in batch_data:
-                    try:
-                        cursor.execute(simple_insert, row_data)
-                        successful_inserts += 1
-                    except psycopg2.Error:
-                        # Skip duplicate rows
-                        continue
-                logging.info(f"[{processing_id}] Successfully inserted {successful_inserts} out of {len(batch_data)} rows")
-            else:
-                raise
+        execute_batch(cursor, insert_query, batch_data, page_size=100)
         
-        # Save file analytics with safer approach
+        # Save file analytics
         file_id = f"{file_metadata.get('year', 0)}_{file_metadata.get('month', 0)}_{file_type}_{processing_id}"
         if not file_metadata.get('parsed_successfully', False):
             file_id = f"unparsed_{datetime.now().strftime('%Y%m%d%H%M%S')}_{file_type}_{processing_id}"
             
         analytics_json = json.dumps(analytics)
-        
-        # Try insert first, then update if it fails
-        try:
-            analytics_query = """
-            INSERT INTO file_analytics (file_id, file_name, file_type, analytics, processed_at) 
-            VALUES (%s, %s, %s, %s, %s)
-            """
-            cursor.execute(analytics_query, (
-                file_id, 
-                file_metadata.get('filename', 'unknown'),
-                file_type,
-                analytics_json, 
-                datetime.now()
-            ))
-        except psycopg2.Error as e:
-            if "duplicate key" in str(e).lower():
-                # Update existing record
-                update_analytics_query = """
-                UPDATE file_analytics 
-                SET analytics = %s, processed_at = %s 
-                WHERE file_id = %s
-                """
-                cursor.execute(update_analytics_query, (
-                    analytics_json,
-                    datetime.now(),
-                    file_id
-                ))
-                logging.info(f"[{processing_id}] Updated existing analytics record")
-            else:
-                raise
+        analytics_query = """
+        INSERT INTO file_analytics (file_id, file_name, file_type, analytics, processed_at) 
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (file_id) DO UPDATE SET
+            analytics = EXCLUDED.analytics,
+            processed_at = EXCLUDED.processed_at
+        """
+        cursor.execute(analytics_query, (
+            file_id, 
+            file_metadata.get('filename', 'unknown'),
+            file_type,
+            analytics_json, 
+            datetime.now()
+        ))
         
         # Commit transaction
         conn.commit()
