@@ -6,163 +6,147 @@ import json
 import pandas as pd
 from datetime import datetime
 import os
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 import psycopg2
 from psycopg2.extras import execute_batch
 from typing import List, Dict, Any
+from retrying import retry
 from dbschema import ensure_database_schema
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-# Blob trigger function - automatically processes new files
+SOURCE_CONTAINER = os.environ.get("BLOB_CONTAINER")
+PROCESSED_CONTAINER = os.environ.get("BLOB_PROCESSED")
+
+# Initialize schema on startup
+try:
+    ensure_database_schema()
+    logging.info("Database schema validated successfully on startup")
+except Exception as e:
+    logging.error(f"Error validating database schema on startup: {str(e)}")
+
+
 @app.blob_trigger(arg_name="myblob", 
                  path="csv-purchases/{name}",
                  connection="AzureWebJobsStorage")
 def process_csv_blob(myblob: func.InputStream):
-    """
-    Process user data CSV files when they are added to the storage account.
+    blob_name = myblob.name.split('/')[-1]  # Get just the filename without path
     
-    Args:
-        myblob: The blob that triggered the function
-    """
-    logging.info(f"Python blob trigger function processed blob: {myblob.name}")
+    logging.info(f"Processing blob: {blob_name} from container: {SOURCE_CONTAINER}")
     
     try:
         # Read the blob content as text
         blob_text = myblob.read().decode('utf-8')
         
-        # Parse the CSV data
-        user_data = process_csv_data(blob_text)
+        # Determine file type based on filename
+        file_type = "users" if "user_data" in blob_name else "purchases" if "purchase_data" in blob_name else "unknown"
         
-        # Get file metadata from the filename (e.g., year and month)
-        file_metadata = extract_file_metadata(myblob.name)
+        if file_type == "unknown":
+            logging.warning(f"Unknown file type for {blob_name}. Skipping processing.")
+            return
+            
+        # Parse the CSV data according to file type
+        if file_type == "users":
+            data_records = process_csv_data(blob_text, file_type="users")
+            file_metadata = extract_file_metadata(blob_name, file_type="users")
+        else:  # purchases
+            data_records = process_csv_data(blob_text, file_type="purchases")
+            file_metadata = extract_file_metadata(blob_name, file_type="purchases")
         
-        # Generate analytics (optional)
-        analytics = generate_analytics(user_data, file_metadata)
+        if not data_records:
+            logging.warning(f"No valid data found in {blob_name}. Skipping processing.")
+            return
+            
+        # Generate analytics
+        analytics = generate_analytics(data_records, file_metadata, file_type)
         
-        # Log some basic statistics
-        logging.info(f"Processed {len(user_data)} user records from {myblob.name}")
-        logging.info(f"Analytics: {json.dumps(analytics)}")
+        # Log processing statistics
+        logging.info(f"Processed {len(data_records)} records from {blob_name}")
         
         # Save data to PostgreSQL database
-        save_to_database(user_data, analytics, file_metadata)
+        save_to_database(data_records, analytics, file_metadata, file_type)
         
-        # Move the processed blob to the processed container
-        move_blob_to_processed(myblob.name)
+        # Move the processed blob to the destination container
+        move_blob_to_processed(blob_name)
+        
+        logging.info(f"Successfully processed {blob_name} and moved to {PROCESSED_CONTAINER}")
         
     except Exception as e:
-        logging.error(f"Error processing {myblob.name}: {str(e)}")
+        logging.error(f"Error processing {blob_name}: {str(e)}")
         raise
 
-# HTTP trigger function - allows manual processing of files
-@app.route(route="process_file")
-def process_file(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    HTTP trigger to manually process a specific file.
-    
-    Args:
-        req: HTTP request with filename parameter
-    
-    Returns:
-        HTTP response with processing results
-    """
-    logging.info('Python HTTP trigger function processed a request.')
-    
-    filename = req.params.get('filename')
-    if not filename:
-        try:
-            req_body = req.get_json()
-            filename = req_body.get('filename')
-        except ValueError:
-            pass
-    
-    if not filename:
-        return func.HttpResponse(
-            "Please pass a filename parameter in the query string or request body",
-            status_code=400
-        )
-    
+
+@retry(stop_max_attempt_number=3, wait_fixed=1000)
+def process_csv_data(csv_data: str, file_type: str = "users") -> List[Dict[str, Any]]:
+    if not csv_data.strip():
+        logging.warning(f"Received empty CSV data for {file_type}")
+        return []
+        
     try:
-        # Connect to blob storage
-        connection_string = os.environ["AzureWebJobsStorage"]
-        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-        container_client = blob_service_client.get_container_client("userdata")
-        blob_client = container_client.get_blob_client(filename)
+        # Parse CSV
+        reader = csv.DictReader(io.StringIO(csv_data))
         
-        # Download blob content
-        blob_data = blob_client.download_blob().readall().decode('utf-8')
-        
-        # Process CSV data
-        user_data = process_csv_data(blob_data)
-        file_metadata = extract_file_metadata(filename)
-        analytics = generate_analytics(user_data, file_metadata)
-        
-        return func.HttpResponse(
-            json.dumps({
-                "filename": filename,
-                "records_processed": len(user_data),
-                "analytics": analytics
-            }),
-            mimetype="application/json"
-        )
-    except Exception as e:
-        logging.error(f"Error processing {filename}: {str(e)}")
-        return func.HttpResponse(
-            f"Error processing file: {str(e)}",
-            status_code=500
-        )
-
-# Helper functions
-def process_csv_data(csv_data: str) -> List[Dict[str, Any]]:
-    """
-    Process CSV data into structured user records.
-    
-    Args:
-        csv_data: String containing CSV data
-    
-    Returns:
-        List of dictionaries containing user data
-    """
-    # Parse CSV
-    reader = csv.DictReader(io.StringIO(csv_data))
-    
-    # Convert to list of dictionaries and parse complex fields
-    user_records = []
-    for row in reader:
-        # Parse JSON fields
-        for field in ['reviews', 'in_cart', 'wishlist']:
-            if field in row and row[field]:
-                try:
-                    row[field] = json.loads(row[field])
-                except json.JSONDecodeError:
-                    # If JSON parsing fails, keep as string
-                    pass
-        
-        # Convert boolean strings to actual booleans
-        if 'is_active' in row:
-            row['is_active'] = row['is_active'].lower() == 'true'
+        # Convert to list of dictionaries and parse complex fields
+        records = []
+        for row in reader:
+            # For user data, parse JSON fields
+            if file_type == "users":
+                for field in ['reviews', 'in_cart', 'wishlist']:
+                    if field in row and row[field]:
+                        try:
+                            row[field] = json.loads(row[field])
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, keep as string
+                            pass
+                
+                # Convert boolean strings to actual booleans
+                if 'is_active' in row:
+                    row['is_active'] = row['is_active'].lower() == 'true'
+                
+                # Convert numeric fields
+                for field in ['purchase_count', 'total_spent']:
+                    if field in row and row[field]:
+                        try:
+                            if field == 'purchase_count':
+                                row[field] = int(row[field])
+                            else:
+                                row[field] = float(row[field])
+                        except (ValueError, TypeError):
+                            # If conversion fails, keep as string
+                            pass
             
-        user_records.append(row)
-    
-    return user_records
+            # For purchase data, convert numeric fields
+            elif file_type == "purchases":
+                numeric_fields = ['quantity', 'unit_price', 'discount_percent', 
+                                 'discount_amount', 'shipping_cost', 'total_price',
+                                 'month', 'year']
+                for field in numeric_fields:
+                    if field in row and row[field]:
+                        try:
+                            if field in ['quantity', 'discount_percent', 'month', 'year']:
+                                row[field] = int(row[field])
+                            else:
+                                row[field] = float(row[field])
+                        except (ValueError, TypeError):
+                            # If conversion fails, keep as string
+                            pass
+            
+            records.append(row)
+        
+        return records
+    except Exception as e:
+        logging.error(f"Error processing CSV data for {file_type}: {str(e)}")
+        raise
 
-def extract_file_metadata(filename: str) -> Dict[str, Any]:
-    """
-    Extract metadata from filename (e.g., user_data_2023_01.csv).
-    
-    Args:
-        filename: The blob filename
-    
-    Returns:
-        Dictionary with file metadata
-    """
+def extract_file_metadata(filename: str, file_type: str = "users") -> Dict[str, Any]:
     try:
         # Extract just the filename without path
         basename = filename.split('/')[-1]
         
-        # Parse year and month from filename pattern user_data_YYYY_MM.csv
+        # Parse year and month from filename pattern
         parts = basename.split('_')
-        if len(parts) >= 4 and parts[0] == 'user' and parts[1] == 'data':
+        if len(parts) >= 4:
             year = int(parts[2])
             month = int(parts[3].split('.')[0])
             
@@ -170,7 +154,8 @@ def extract_file_metadata(filename: str) -> Dict[str, Any]:
                 "year": year,
                 "month": month,
                 "period": f"{year}-{month:02d}",
-                "filename": basename
+                "filename": basename,
+                "file_type": file_type
             }
     except (IndexError, ValueError) as e:
         logging.warning(f"Could not parse metadata from filename {filename}: {str(e)}")
@@ -178,149 +163,185 @@ def extract_file_metadata(filename: str) -> Dict[str, Any]:
     # Default metadata if parsing fails
     return {
         "filename": filename.split('/')[-1],
-        "processed_time": datetime.now().isoformat()
+        "processed_time": datetime.now().isoformat(),
+        "file_type": file_type
     }
 
-def generate_analytics(user_data: List[Dict[str, Any]], metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Generate basic analytics from user data.
-    
-    Args:
-        user_data: List of user records
-        metadata: File metadata
-    
-    Returns:
-        Dictionary with analytics results
-    """
-    # Use pandas for easier data analysis
-    if not user_data:
-        return {"error": "No data to analyze"}
-    
-    df = pd.DataFrame(user_data)
-    
+def generate_analytics(data: List[Dict[str, Any]], metadata: Dict[str, Any], file_type: str) -> Dict[str, Any]:
     analytics = {
-        "total_records": len(df),
+        "record_count": len(data),
+        "file_type": file_type,
         "period": metadata.get("period", "unknown"),
+        "processed_at": datetime.now().isoformat()
     }
     
-    # User type distribution
-    if 'user_type' in df.columns:
-        user_type_counts = df['user_type'].value_counts().to_dict()
-        analytics["user_type_distribution"] = user_type_counts
+    # Skip empty data
+    if not data:
+        return analytics
     
-    # Active users percentage
-    if 'is_active' in df.columns:
-        active_percent = (df['is_active'].sum() / len(df)) * 100
-        analytics["active_users_percent"] = round(active_percent, 2)
+    # Convert to pandas DataFrame for easier analysis
+    df = pd.DataFrame(data)
     
-    # Device distribution
-    if 'last_device' in df.columns:
-        device_counts = df['last_device'].value_counts().to_dict()
-        analytics["device_distribution"] = device_counts
+    # User data analytics
+    if file_type == "users":
+        # User type distribution
+        if 'user_type' in df.columns:
+            analytics["user_type_distribution"] = df['user_type'].value_counts().to_dict()
+        
+        # Active users percentage
+        if 'is_active' in df.columns:
+            active_count = df['is_active'].sum() if isinstance(df['is_active'].iloc[0], bool) else df['is_active'].apply(lambda x: x == 'true' or x == 'True').sum()
+            analytics["active_users_percent"] = round((active_count / len(df)) * 100, 2)
+        
+        # Device distribution
+        if 'last_device' in df.columns:
+            analytics["device_distribution"] = df['last_device'].value_counts().to_dict()
+        
+        # Browser distribution
+        if 'last_browser' in df.columns:
+            analytics["browser_distribution"] = df['last_browser'].value_counts().to_dict()
     
-    # Most common products in cart/wishlist
-    if 'in_cart' in df.columns and isinstance(df['in_cart'].iloc[0], list):
-        # Flatten all cart items into a single list
-        all_cart_items = [item for sublist in df['in_cart'].dropna() for item in sublist]
-        if all_cart_items:
-            # Count occurrences of each product
-            from collections import Counter
-            top_products = Counter(all_cart_items).most_common(5)
-            analytics["top_cart_products"] = dict(top_products)
+    # Purchase data analytics
+    elif file_type == "purchases":
+        # Total sales
+        if 'total_price' in df.columns:
+            analytics["total_sales"] = float(df['total_price'].sum())
+        
+        # Average order value
+        if 'total_price' in df.columns:
+            analytics["average_order_value"] = float(df['total_price'].mean())
+        
+        # Product category distribution
+        if 'product_category' in df.columns:
+            analytics["category_distribution"] = df['product_category'].value_counts().to_dict()
+        
+        # Payment method distribution
+        if 'payment_method' in df.columns:
+            analytics["payment_method_distribution"] = df['payment_method'].value_counts().to_dict()
+        
+        # Discount analytics
+        if 'discount_percent' in df.columns and 'discount_amount' in df.columns:
+            analytics["discount_usage_percent"] = round((df['discount_percent'] > 0).sum() / len(df) * 100, 2)
+            analytics["total_discount_amount"] = float(df['discount_amount'].sum())
     
     return analytics
 
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
 def move_blob_to_processed(blob_name: str):
-    """
-    Move a blob from csv-purchases to csv-processed container.
-    
-    Args:
-        blob_name: Name of the blob to move
-    """
     try:
         # Get connection string from app settings
         connection_string = os.environ["AzureWebJobsStorage"]
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         
-        # Get source blob
-        source_container = "csv-purchases"
-        source_blob_client = blob_service_client.get_blob_client(container=source_container, blob=blob_name)
+        # Get source blob client
+        source_blob_client = blob_service_client.get_blob_client(
+            container=SOURCE_CONTAINER, 
+            blob=blob_name
+        )
         
-        # Get destination blob
-        dest_container = "csv-processed"
-        dest_container_client = blob_service_client.get_container_client(dest_container)
-        
-        # Create destination container if it doesn't exist
+        # Ensure destination container exists
+        dest_container_client = blob_service_client.get_container_client(PROCESSED_CONTAINER)
         try:
             dest_container_client.create_container()
-        except:
-            # Container already exists
+            logging.info(f"Created destination container: {PROCESSED_CONTAINER}")
+        except ResourceExistsError:
+            # Container already exists, which is fine
             pass
         
-        # Copy source to destination
-        dest_blob_client = blob_service_client.get_blob_client(container=dest_container, blob=blob_name)
+        # Get destination blob client
+        dest_blob_client = blob_service_client.get_blob_client(
+            container=PROCESSED_CONTAINER,
+            blob=blob_name
+        )
+        
+        # Copy blob data
         source_blob_data = source_blob_client.download_blob().readall()
         dest_blob_client.upload_blob(source_blob_data, overwrite=True)
+        logging.info(f"Copied {blob_name} to {PROCESSED_CONTAINER}")
         
-        # Delete source blob
+        # Delete source blob after successful copy
         source_blob_client.delete_blob()
+        logging.info(f"Deleted {blob_name} from {SOURCE_CONTAINER}")
         
-        logging.info(f"Successfully moved {blob_name} to processed container")
+    except ResourceNotFoundError as e:
+        logging.error(f"Blob or container not found: {str(e)}")
+        raise
     except Exception as e:
         logging.error(f"Error moving blob {blob_name}: {str(e)}")
         raise
 
-def save_to_database(user_data: List[Dict[str, Any]], analytics: Dict[str, Any], file_metadata: Dict[str, Any]):
-    """
-    Save processed user data to PostgreSQL database.
-    
-    Args:
-        user_data: List of user records
-        analytics: Generated analytics
-        file_metadata: File metadata
-    """
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+def save_to_database(data: List[Dict[str, Any]], analytics: Dict[str, Any], file_metadata: Dict[str, Any], file_type: str):
+    if not data:
+        logging.warning(f"No data to save to database for {file_type}")
+        return
+        
     try:
         # Get database connection info from app settings
         db_host = os.environ["POSTGRES_HOST"]
         db_name = os.environ["POSTGRES_DB"]
         db_user = os.environ["POSTGRES_USER"]
         db_password = os.environ["POSTGRES_PASSWORD"]
+        ssl_mode = os.environ.get("POSTGRES_SSL_MODE", "require")
         
-        # Connect to PostgreSQL
+        # Connect to PostgreSQL with SSL mode
         conn = psycopg2.connect(
             host=db_host,
             database=db_name,
             user=db_user,
-            password=db_password
+            password=db_password,
+            sslmode=ssl_mode
         )
         
         # Create cursor
         cursor = conn.cursor()
         
-        # Prepare batch insert for users table
-        users_columns = ", ".join(user_data[0].keys())
-        users_placeholders = ", ".join(["%s"] * len(user_data[0].keys()))
-        users_insert_query = f"INSERT INTO users ({users_columns}) VALUES ({users_placeholders})"
+        # Prepare batch insert based on file type
+        if file_type == "users":
+            table_name = "users"
+        else:  # purchases
+            table_name = "purchases"
         
-        # Convert complex fields (JSON) to strings for database
+        # Get column names from the data
+        columns = list(data[0].keys())
+        column_str = ", ".join([f'"{col}"' for col in columns])
+        placeholders = ", ".join(["%s"] * len(columns))
+        
+        # Prepare insert query
+        insert_query = f'INSERT INTO {table_name} ({column_str}) VALUES ({placeholders})'
+        
+        # Prepare batch data
         batch_data = []
-        for user in user_data:
-            row_data = []
-            for key, value in user.items():
+        for record in data:
+            row_values = []
+            for col in columns:
+                value = record.get(col)
+                # Convert JSON fields to strings for database
                 if isinstance(value, (list, dict)):
-                    row_data.append(json.dumps(value))
-                else:
-                    row_data.append(value)
-            batch_data.append(tuple(row_data))
+                    value = json.dumps(value)
+                row_values.append(value)
+            batch_data.append(tuple(row_values))
         
         # Execute batch insert
-        execute_batch(cursor, users_insert_query, batch_data)
+        execute_batch(cursor, insert_query, batch_data, page_size=100)
         
         # Save file analytics
-        file_id = f"{file_metadata.get('year', 0)}_{file_metadata.get('month', 0)}"
+        file_id = f"{file_metadata.get('year', 0)}_{file_metadata.get('month', 0)}_{file_type}"
+        if 'year' not in file_metadata or 'month' not in file_metadata:
+            file_id = f"unknown_{datetime.now().strftime('%Y%m%d%H%M%S')}_{file_type}"
+            
         analytics_json = json.dumps(analytics)
-        analytics_query = "INSERT INTO file_analytics (file_id, file_name, analytics, processed_at) VALUES (%s, %s, %s, %s)"
-        cursor.execute(analytics_query, (file_id, file_metadata.get('filename'), analytics_json, datetime.now()))
+        analytics_query = """
+        INSERT INTO file_analytics (file_id, file_name, file_type, analytics, processed_at) 
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(analytics_query, (
+            file_id, 
+            file_metadata.get('filename', 'unknown'),
+            file_type,
+            analytics_json, 
+            datetime.now()
+        ))
         
         # Commit transaction
         conn.commit()
@@ -329,7 +350,7 @@ def save_to_database(user_data: List[Dict[str, Any]], analytics: Dict[str, Any],
         cursor.close()
         conn.close()
         
-        logging.info(f"Successfully saved {len(user_data)} records to database")
+        logging.info(f"Successfully saved {len(data)} {file_type} records to database")
     except Exception as e:
-        logging.error(f"Error saving to database: {str(e)}")
+        logging.error(f"Error saving {file_type} data to database: {str(e)}")
         raise

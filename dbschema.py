@@ -57,10 +57,37 @@ def ensure_database_schema():
             wishlist JSONB,
             last_search TEXT,
             created_date VARCHAR(20),
+            purchase_count INT,
+            total_spent DECIMAL(12, 2),
             processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
         cursor.execute(users_table_query)
+        
+        # Create purchases table if it doesn't exist
+        purchases_table_query = """
+        CREATE TABLE IF NOT EXISTS purchases (
+            id SERIAL PRIMARY KEY,
+            transaction_id VARCHAR(20),
+            user_email VARCHAR(255),
+            product_name VARCHAR(100),
+            product_category VARCHAR(50),
+            quantity INT,
+            unit_price DECIMAL(10, 2),
+            discount_percent INT,
+            discount_amount DECIMAL(10, 2),
+            shipping_cost DECIMAL(10, 2),
+            total_price DECIMAL(10, 2),
+            purchase_date VARCHAR(20),
+            purchase_time VARCHAR(20),
+            payment_method VARCHAR(50),
+            purchase_status VARCHAR(20),
+            month INT,
+            year INT,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        cursor.execute(purchases_table_query)
         
         # Create file_analytics table if it doesn't exist
         analytics_table_query = """
@@ -68,14 +95,19 @@ def ensure_database_schema():
             id SERIAL PRIMARY KEY,
             file_id VARCHAR(50),
             file_name VARCHAR(255),
+            file_type VARCHAR(20),
             analytics JSONB,
             processed_at TIMESTAMP
         );
         """
         cursor.execute(analytics_table_query)
         
-        # Create index on user_id for better performance
+        # Create indexes for better performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users (user_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_purchases_transaction_id ON purchases (transaction_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_purchases_user_email ON purchases (user_email);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_purchases_date ON purchases (year, month);")
         
         # Close cursor and connection
         cursor.close()
