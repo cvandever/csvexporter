@@ -185,7 +185,7 @@ def log_processing_result(filename: str, status: str, error_message: str):
         logging.error(f"Error logging result: {str(e)}")
 
 # Test endpoint to verify function is working
-@app.route(route="health", auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="health", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET"])
 def health_check(req: func.HttpRequest) -> func.HttpResponse:
     """Simple health check endpoint."""
     try:
